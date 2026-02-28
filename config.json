@@ -1,0 +1,1 @@
+{"port_scanning": {"enabled": true, "ports": ["22", "80", "443"], "timeout": 2000}, "thread_count": 10, "timeouts": {"connection": 5000, "response": 10000}, "export_options": {"export_format": ["json", "csv"], "export_directory": "./exports"}}
