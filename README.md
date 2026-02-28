@@ -27,15 +27,15 @@ EAGLE SCANNER is a powerful port scanning tool designed to provide detailed info
 ## Usage Examples
 - Basic scan on a target:
   ```bash
-  python eaglescan.py -t 192.168.1.1
+  python eaglescan.py -t 192......
   ```
 - Scan specific ports:
   ```bash
-  python eaglescan.py -t 192.168.1.1 -p 22,80,443
+  python eaglescan.py -t 192..... -p 22,80,443
   ```
 - Export results to JSON:
   ```bash
-  python eaglescan.py -t 192.168.1.1 -o results.json
+  python eaglescan.py -t 192........ -o results.json
   ```
 
 ## Output Formats
@@ -47,7 +47,7 @@ EAGLE SCANNER supports the following output formats:
 ## CVE Database Integration
 EAGLE SCANNER leverages the CVE database to provide insights on vulnerabilities associated with the detected services. Users can access vulnerability information through the `--cve` flag:
 ```bash
-python eaglescan.py -t 192.168.1.1 --cve
+python eaglescan.py -t 192....... --cve
 ```
 
 ## Legal Notice
