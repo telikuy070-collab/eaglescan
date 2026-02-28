@@ -168,6 +168,6 @@ Contributions welcome! Please read the contributing guidelines first.
 
 ---
 
-**Author:** Your Name  
+**Author:** noobsaybot
 **For:** Cybersecurity Learning Project  
 **Stack:** C++20, Neural Networks, Network Programming
