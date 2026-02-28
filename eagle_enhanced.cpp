@@ -3,9 +3,9 @@
  *  🦅 EAGLE AI SCANNER v7.0 - NEURAL NETWORK EDITION
  *  Modern C++20 Port Scanner with AI OS Fingerprinting
  * 
- *  Author: Your Name
+ *  Author: noob saybot
  *  License: MIT
- *  GitHub: github.com/yourusername/eagle-ai-scanner
+ *  GitHub: github.com/telikuy070-collab/eagle-ai-scanner
  * ════════════════════════════════════════════════════════════════════
  */
 
