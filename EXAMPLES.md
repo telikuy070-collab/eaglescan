@@ -6,7 +6,7 @@
  * This file contains practical examples of how to use Eagle AI Scanner
  * for various cybersecurity tasks.
  * 
- * Author: Your Name
+ * Author: noobsaybot
  * For: GitHub Portfolio Project
  * ════════════════════════════════════════════════════════════════════
  */
