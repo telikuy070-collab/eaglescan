@@ -1,34 +1,25 @@
-# Usage Examples for EagleScan
+# Example Documentation
 
-## Example 1: Basic Usage
-To get started with EagleScan, simply run the following command:
-```bash
-$ eaglescan --help
+This document contains examples of using the system with various IP addresses. 
+All public IP addresses have been replaced with localhost and private IP ranges.
+
+## Example 1
+Connecting to the server:
+```
+Host: localhost
+Port: 8080
 ```
 
-## Example 2: Scanning for Issues
-To scan a repository for potential issues, use:
-```bash
-$ eaglescan scan --repository <repository-url>
+## Example 2
+Using a private IP range for testing:
+```
+Host: 192.168.1.1
+Port: 80
 ```
 
-## Example 3: Generating a Report
-After scanning, you can generate a report with the following command:
-```bash
-$ eaglescan report --output report.md
+## Example 3
+Another example with localhost:
 ```
-
-## Example 4: Custom Configurations
-You can customize your scan settings using a configuration file:
-```bash
-$ eaglescan --config custom-settings.yaml
+Host: 127.0.0.1
+Port: 443
 ```
-
-## Example 5: Integration with CI/CD
-Integrate EagleScan into your CI/CD pipeline by adding:
-```yaml
-- name: EagleScan
-  run: eaglescan scan --repository <repository-url>
-```
-
-For more detailed information, refer to the [official documentation](https://example.com/docs).
