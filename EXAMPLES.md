@@ -13,7 +13,7 @@ Port: 8080
 ## Example 2
 Using a private IP range for testing:
 ```
-Host: 192........
+Host: 192.........
 Port: 80
 ```
 
