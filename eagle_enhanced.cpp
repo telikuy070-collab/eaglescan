@@ -1,92 +1,91 @@
-#include <iostream>
-#include <string>
-#include <thread>
-#include <vector>
-#include <map>
-#include <mutex>
-#include <curl/curl.h>
-#include <json/json.h>
-// Include other necessary libraries for network operations and data handling
+// Comprehensive Port Scanner
 
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <csv.h>
+#include <xmlpp/xmlpp.h>
+
+// Constants
+const int MAX_THREADS = 256;
+
+// Mutex for thread safety
 std::mutex mtx;
 
-// Functions for scanning TCP and UDP ports
-void tcpScan(const std::string &ip, int port) {
-    // TCP scan logic here 
+// Function declarations
+void scanPort(const std::string& ip, int port, std::string protocol);
+void tcpScan(const std::string& ip);
+void udpScan(const std::string& ip);
+void serviceDetection(int port);
+void versionDetection(int port);
+void osFingerprinting(const std::string& ip);
+void wafDetection(const std::string& ip);
+void cveLookup(int port);
+void exportResults(const nlohmann::json& results, const std::string& format);
+
+// Main scanning function
+void scan(const std::string& ip) {
+    tcpScan(ip);
+    udpScan(ip);
+    osFingerprinting(ip);
 }
 
-void udpScan(const std::string &ip, int port) {
-    // UDP scan logic here 
-}
-
-// Function for service detection
-std::string serviceDetection(int port) {
-    // Logic to detect service running on the given port
-    return "service_name";
-}
-
-// Function for version detection
-std::string versionDetection(const std::string &service) {
-    // Logic to detect version of the service
-    return "version_info";
-}
-
-// Function for OS fingerprinting
-std::string osFingerprinting(const std::string &ip) {
-    // Logic for OS fingerprinting
-    return "OS_name";
-}
-
-// Function for WAF detection
-bool isWAFDetected(const std::string &ip) {
-    // Logic to detect if a WAF is present
-    return false;
-}
-
-// Function for CVE lookup
-void cveLookup(const std::string &service, const std::string &version) {
-    // Call CVE database API and gather relevant information
-}
-
-// Function for exporting results to JSON, CSV, or XML
-void exportResults(const std::map<int, std::string> &results, const std::string &format) {
-    // Logic to export results in specified format
-}
-
-// Main scanner function
-void portScanner(const std::string &ip) {
+// TCP Scan Implementation
+void tcpScan(const std::string& ip) {
+    std::vector<int> ports = {80, 443, 21, 22}; // Example ports
     std::vector<std::thread> threads;
-    std::map<int, std::string> results;
-    
-    // Loop through ports and start TCP/UDP scans
-    for (int port = 1; port <= 65535; ++port) {
-        threads.push_back(std::thread([&, port] {
-            tcpScan(ip, port);
-            udpScan(ip, port);
-            std::lock_guard<std::mutex> lock(mtx);
-            results[port] = serviceDetection(port);
-        }));
+    for (int port : ports) {
+        threads.emplace_back(scanPort, ip, port, "TCP");
     }
-
-    for (auto &t : threads) {
-        t.join();  // Wait for all threads to finish
+    for (auto& th : threads) {
+        th.join();
     }
-
-    // WAF detection
-    isWAFDetected(ip);
-    
-    // Export results
-    exportResults(results, "json");
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <IP address>" << std::endl;
+// UDP Scan Implementation
+void udpScan(const std::string& ip) {
+    std::vector<int> ports = {53, 67, 123}; // Example ports
+    std::vector<std::thread> threads;
+    for (int port : ports) {
+        threads.emplace_back(scanPort, ip, port, "UDP");
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+}
+
+// Scan a specific port
+void scanPort(const std::string& ip, int port, std::string protocol) {
+    // Placeholder for actual scanning logic
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Simulate scan delay
+    std::lock_guard<std::mutex> lock(mtx);
+    std::cout << "Scanned " << protocol << " port " << port << " on " << ip << std::endl;
+    serviceDetection(port);
+    versionDetection(port);
+    cveLookup(port);
+}
+
+// Services, versions, and CVE checks
+void serviceDetection(int port) { /* ... */ }
+void versionDetection(int port) { /* ... */ }
+void osFingerprinting(const std::string& ip) { /* ... */ }
+void wafDetection(const std::string& ip) { /* ... */ }
+void cveLookup(int port) { /* ... */ }
+
+// Export results to desired format
+void exportResults(const nlohmann::json& results, const std::string& format) {
+    // Implement JSON, CSV, XML export functionality here
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <IP address>\n";
         return 1;
     }
-
-    std::string targetIP = argv[1];
-    portScanner(targetIP);
-    
+    std::string ip = argv[1];
+    scan(ip);
     return 0;
 }
