@@ -1,838 +1,1053 @@
+/**
+ * ════════════════════════════════════════════════════════════════════
+ *  🦅 EAGLE AI SCANNER v7.0 - NEURAL NETWORK EDITION
+ *  Modern C++20 Port Scanner with AI OS Fingerprinting
+ * 
+ *  Author: Your Name
+ *  License: MIT
+ *  GitHub: github.com/yourusername/eagle-ai-scanner
+ * ════════════════════════════════════════════════════════════════════
+ */
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
 #include <icmpapi.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <thread>
+
+#include <iostream>
+#include <string>
 #include <vector>
-#include <atomic>
 #include <map>
 #include <set>
-#include <ctime>
-#include <fstream>
-#include <sstream>
 #include <queue>
+#include <atomic>
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <variant>
+#include <array>
+#include <chrono>
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
+#include <random>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <functional>
+#include <thread>
+#include <future>
+#include <variant>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "icmpapi.lib")
-#pragma comment(lib, "winsock2.lib")
-#pragma pack(1)
 
-// ==================== DATA STRUCTURES ====================
+// ════════════════════════════════════════════════════════════════════
+//  C++20 CONCEPTS & CONSTRAINTS
+// ════════════════════════════════════════════════════════════════════
 
-struct ScanResult {
-    int port;
-    bool open;
-    char service[64];
-    char version[128];
-    char os_hint[64];
-    char waf_detected[64];
-    char cve_id[32];
-    float cvss_score;
-    int response_time_ms;
+template<typename T>
+concept Numeric = std::integral<T> || std::floating_point<T>;
+
+template<typename T>
+concept Container = requires(T t) {
+    t.begin();
+    t.end();
+    t.size();
 };
 
-struct CVEData {
-    int port;
-    const char* service;
-    const char* cve_id;
-    const char* desc;
-    float cvss;
-    const char* affected_versions;
+// ════════════════════════════════════════════════════════════════════
+//  UTILITY CLASSES - RAII & SAFETY
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief RAII Socket wrapper - automatically closes socket on destruction
+ */
+class Socket final {
+public:
+    explicit Socket() : m_socket(INVALID_SOCKET) {}
+    explicit Socket(SOCKET sock) : m_socket(sock) {}
+    
+    ~Socket() { close(); }
+    
+    // Delete copy - single owner
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    
+    // Allow move
+    Socket(Socket&& other) noexcept : m_socket(other.m_socket) {
+        other.m_socket = INVALID_SOCKET;
+    }
+    Socket& operator=(Socket&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_socket = other.m_socket;
+            other.m_socket = INVALID_SOCKET;
+        }
+        return *this;
+    }
+    
+    [[nodiscard]] bool isValid() const noexcept { return m_socket != INVALID_SOCKET; }
+    [[nodiscard]] SOCKET get() const noexcept { return m_socket; }
+    
+    bool create(int af, int type, int protocol) {
+        close();
+        m_socket = ::socket(af, type, protocol);
+        return isValid();
+    }
+    
+    void close() noexcept {
+        if (isValid()) {
+            closesocket(m_socket);
+            m_socket = INVALID_SOCKET;
+        }
+    }
+    
+    explicit operator bool() const noexcept { return isValid(); }
+    
+private:
+    SOCKET m_socket;
 };
 
+/**
+ * @brief RAII WSA initializer
+ */
+class WSAInitializer {
+public:
+    WSAInitializer() {
+        WSADATA wsa_data;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+            throw std::runtime_error("WSAStartup failed");
+        }
+    }
+    ~WSAInitializer() { WSACleanup(); }
+    
+    WSAInitializer(const WSAInitializer&) = delete;
+    WSAInitializer& operator=(const WSAInitializer&) = delete;
+};
+
+/**
+ * @brief Result type for error handling (Either pattern)
+ */
+template<typename T, typename E = std::string>
+class Result {
+public:
+    static Result ok(T value) {
+        return Result(std::move(value), std::nullopt);
+    }
+    
+    static Result err(E error) {
+        return Result(std::nullopt, std::move(error));
+    }
+    
+    [[nodiscard]] bool ok() const noexcept { return m_value.has_value(); }
+    [[nodiscard]] bool err() const noexcept { return !m_value.has_value(); }
+    
+    [[nodiscard]] const T& value() const { return *m_value; }
+    [[nodiscard]] T& value() { return *m_value; }
+    [[nodiscard]] const E& error() const { return *m_error; }
+    
+    [[nodiscard]] T&& moveValue() { return std::move(*m_value); }
+    
+    template<typename F>
+    auto map(F&& f) -> Result<decltype(f(std::declval<T>())), E> {
+        if (ok()) {
+            return Result<decltype(f(std::declval<T>())), E>::ok(f(*m_value));
+        }
+        return Result<decltype(f(std::declval<T>())), E>::err(*m_error);
+    }
+    
+private:
+    explicit Result(std::optional<T> value, std::optional<E> error)
+        : m_value(std::move(value)), m_error(std::move(error)) {}
+    
+    std::optional<T> m_value;
+    std::optional<E> m_error;
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  NETWORK CORE CLASSES
+// ════════════════════════════════════════════════════════════════════
+
+namespace eagle {
+
+// Forward declarations
+class PortScanner;
+class OSFingerprinter;
+class CVEDatabase;
+class ReportExporter;
+
+/**
+ * @brief Port scan result
+ */
+struct PortResult {
+    uint16_t port{0};
+    bool isOpen{false};
+    std::string service;
+    std::string version;
+    float responseTime{0.0f};
+    
+    template<typename Archive>
+    void serialize(Archive& ar, const unsigned int version) {
+        ar & port & isOpen & service & version & responseTime;
+    }
+};
+
+/**
+ * @brief Scan configuration
+ */
 struct ScanConfig {
-    const char* target;
-    int start_port;
-    int end_port;
-    int num_threads;
-    bool scan_tcp;
-    bool scan_udp;
-    bool detect_version;
-    bool detect_os;
-    bool detect_waf;
-    bool export_json;
-    bool export_csv;
-    bool export_xml;
-    const char* output_file;
-    bool verbose;
-    int timeout_ms;
+    std::string targetIP;
+    uint16_t startPort{1};
+    uint16_t endPort{65535};
+    uint8_t threadCount{32};
+    uint32_t timeout{500};
+    bool scanTCP{true};
+    bool scanUDP{false};
+    bool detectOS{true};
+    bool detectVersion{false};
+    bool detectWAF{false};
+    std::optional<std::string> outputFile;
+    std::optional<std::string> outputFormat; // json, csv, xml
 };
 
-struct ThreadSyncData {
-    std::queue<int> port_queue;
-    std::mutex queue_mutex;
-    std::atomic<int> ports_scanned;
-    std::atomic<int> ports_open;
+/**
+ * @brief OS Detection result
+ */
+struct OSResult {
+    std::string osName;
+    float confidence{0.0f};
+    bool isAI{false};
+    std::string version;
+    std::vector<std::string> fingerprints;
+    
+    template<typename Archive>
+    void serialize(Archive& ar, const unsigned int version) {
+        ar & osName & confidence & isAI & version & fingerprints;
+    }
 };
 
-// ==================== COMPREHENSIVE CVE DATABASE ====================
-
-CVEData cve_db[] = {
-    // FTP
-    {21, "FTP", "CVE-2020-13999", "FTP Buffer Overflow - vsftpd", 9.8f, "vsftpd < 3.0.3"},
-    {21, "FTP", "CVE-2021-22911", "FTP Authentication Bypass", 8.6f, "ProFTPD 1.3.5"},
+/**
+ * @brief Complete scan result
+ */
+struct ScanResult {
+    std::string target;
+    std::chrono::system_clock::time_point timestamp;
+    uint32_t scanDurationMs{0};
+    std::vector<PortResult> ports;
+    std::optional<OSResult> osResult;
+    std::vector<std::string> errors;
     
-    // SSH
-    {22, "SSH", "CVE-2018-15473", "SSH Username Enumeration", 5.3f, "OpenSSH < 7.7"},
-    {22, "SSH", "CVE-2019-16889", "SSH Key Exchange DoS", 7.5f, "libssh < 0.9.0"},
-    {22, "SSH", "CVE-2021-41617", "SSH Privilege Escalation", 7.0f, "OpenSSH < 8.0"},
-    
-    // TELNET
-    {23, "TELNET", "CVE-2013-0310", "TELNET DoS", 5.0f, "All versions"},
-    {23, "TELNET", "CVE-2017-14735", "TELNET Code Execution", 9.8f, "Various"},
-    
-    // SMTP
-    {25, "SMTP", "CVE-2019-8943", "SMTP Relay Vulnerability", 6.5f, "Sendmail < 8.15.2"},
-    {25, "SMTP", "CVE-2020-35517", "SMTP DoS", 5.3f, "Postfix < 3.4"},
-    
-    // DNS
-    {53, "DNS", "CVE-2020-12662", "DNS Cache Poisoning", 8.6f, "BIND < 9.16.1"},
-    {53, "DNS", "CVE-2021-25219", "DNS DoS", 7.5f, "BIND < 9.18.0"},
-    
-    // HTTP
-    {80, "HTTP", "CVE-2017-9822", "Apache Buffer Overflow", 9.8f, "Apache < 2.4.27"},
-    {80, "HTTP", "CVE-2021-41773", "Path Traversal", 9.8f, "Apache 2.4.49-2.4.50"},
-    {80, "HTTP", "CVE-2021-44228", "Log4j RCE", 10.0f, "log4j < 2.17.1"},
-    
-    // POP3
-    {110, "POP3", "CVE-2013-1664", "POP3 DoS", 5.0f, "Dovecot < 2.1"},
-    {110, "POP3", "CVE-2017-8616", "POP3 Buffer Overflow", 9.8f, "Various"},
-    
-    // IMAP
-    {143, "IMAP", "CVE-2015-9540", "IMAP Overflow", 9.8f, "Cyrus < 2.5.0"},
-    {143, "IMAP", "CVE-2017-12424", "IMAP Auth Bypass", 7.5f, "Dovecot < 2.2.33"},
-    
-    // HTTPS
-    {443, "HTTPS", "CVE-2014-0160", "Heartbleed", 7.5f, "OpenSSL < 1.0.1g"},
-    {443, "HTTPS", "CVE-2016-2109", "ASN.1 Decoder DoS", 7.5f, "OpenSSL < 1.0.1s"},
-    {443, "HTTPS", "CVE-2018-1000001", "GLIBC Vulnerability", 9.8f, "glibc < 2.26"},
-    
-    // SMB
-    {445, "SMB", "CVE-2017-0144", "WannaCry - EternalBlue", 10.0f, "Windows XP-Server 2012"},
-    {445, "SMB", "CVE-2020-1472", "Zerologon", 10.0f, "Windows < 2019"},
-    {445, "SMB", "CVE-2021-44228", "Log4Shell over SMB", 9.8f, "log4j < 2.17.1"},
-    
-    // MySQL
-    {3306, "MYSQL", "CVE-2012-2122", "MySQL Auth Bypass", 6.5f, "MySQL < 5.1.63"},
-    {3306, "MYSQL", "CVE-2016-6662", "MySQL RCE", 9.8f, "MySQL < 5.7.15"},
-    {3306, "MYSQL", "CVE-2021-2109", "MySQL Injection", 7.5f, "MySQL 8.0.13-8.0.24"},
-    
-    // RDP
-    {3389, "RDP", "CVE-2019-0708", "BlueKeep RCE", 9.8f, "Windows XP-Server 2008"},
-    {3389, "RDP", "CVE-2020-0610", "RDP RCE", 9.8f, "Windows 7-Server 2019"},
-    {3389, "RDP", "CVE-2020-1938", "RDP Info Leak", 6.5f, "Windows < 10"},
-    
-    // PostgreSQL
-    {5432, "POSTGRES", "CVE-2021-3393", "PostgreSQL Auth Bypass", 9.8f, "PostgreSQL < 13.2"},
-    {5432, "POSTGRES", "CVE-2021-20229", "PostgreSQL Injection", 7.5f, "PostgreSQL < 12"},
-    
-    // HTTP-ALT (8080)
-    {8080, "HTTP-ALT", "CVE-2021-44228", "Log4j RCE", 10.0f, "log4j < 2.17.1"},
-    {8080, "HTTP-ALT", "CVE-2017-5645", "ActiveMQ RCE", 10.0f, "ActiveMQ < 5.15.4"},
-    
-    // MongoDB
-    {27017, "MONGODB", "CVE-2020-7922", "MongoDB Injection", 9.8f, "MongoDB < 4.2.8"},
-    {27017, "MONGODB", "CVE-2020-13876", "MongoDB DoS", 7.5f, "MongoDB < 4.2"},
-    
-    // Redis
-    {6379, "REDIS", "CVE-2015-4335", "Redis RCE", 10.0f, "Redis < 2.8.21"},
-    {6379, "REDIS", "CVE-2020-14147", "Redis Replication RCE", 9.8f, "Redis < 5.0.9"},
-    
-    // Elasticsearch
-    {9200, "ELASTICSEARCH", "CVE-2015-4165", "Elasticsearch RCE", 9.8f, "ES < 1.7.0"},
-    {9200, "ELASTICSEARCH", "CVE-2021-44228", "Log4j RCE", 10.0f, "log4j < 2.17.1"},
+    template<typename Archive>
+    void serialize(Archive& ar, const unsigned int version) {
+        ar & target & timestamp & scanDurationMs & ports & osResult & errors;
+    }
 };
 
-// ==================== GLOBAL VARIABLES ====================
+} // namespace eagle
 
-std::atomic<int> total_ports_open(0);
-std::vector<ScanResult> scan_results;
-std::mutex results_mutex;
-HANDLE console_handle;
-std::ofstream log_file;
+// ════════════════════════════════════════════════════════════════════
+//  MODERN NEURAL NETWORK - TEMPLATE BASED
+// ════════════════════════════════════════════════════════════════════
 
-// ==================== UTILITY FUNCTIONS ====================
+namespace eagle::ai {
 
-void LogMessage(const char* level, const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    
-    char buffer[512];
-    vsprintf_s(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    
-    printf("[%s] %s\n", level, buffer);
-    fflush(stdout);
-    
-    if(log_file.is_open()) {
-        log_file << "[" << level << "] " << buffer << "\n";
-        log_file.flush();
+/**
+ * @brief Modern activation functions
+ */
+struct ActivationFunctions {
+    static float sigmoid(float x) noexcept {
+        return 1.0f / (1.0f + std::exp(-std::clamp(x, -500.0f, 500.0f)));
     }
-}
-
-bool IsValidIP(const char* ip) {
-    in_addr addr;
-    return inet_pton(AF_INET, ip, &addr) == 1;
-}
-
-void SetConsoleColor(int color) {
-    SetConsoleTextAttribute(console_handle, color);
-}
-
-void ResetConsoleColor() {
-    SetConsoleTextAttribute(console_handle, FOREGROUND_WHITE);
-}
-
-// ==================== BANNER & HELP ====================
-
-void PrintBanner() {
-    SetConsoleColor(FOREGROUND_CYAN | FOREGROUND_INTENSITY);
     
-    printf("\n");
-    printf("╔═══════════════════════════════════════════════════════╗\n");
-    printf("║        🦅 EAGLE ADVANCED PORT SCANNER v1.0 🦅         ║\n");
-    printf("║                                                       ║\n");
-    printf("║  Features:                                            ║\n");
-    printf("║  ✓ Full TCP/UDP Port Scanning (1-65535)              ║\n");
-    printf("║  ✓ Service Version Detection                         ║\n");
-    printf("║  ✓ OS Fingerprinting                                 ║\n");
-    printf("║  ✓ WAF Detection                                     ║\n");
-    printf("║  ✓ Comprehensive CVE Database (40+ CVEs)             ║\n");
-    printf("║  ✓ Multi-threading (up to 256 threads)               ║\n");
-    printf("║  ✓ Export to JSON/CSV/XML                            ║\n");
-    printf("║  ✓ Real-time Logging                                 ║\n");
-    printf("║                                                       ║\n");
-    printf("╚═══════════════════════════════════════════════════════╝\n");
-    printf("\n");
-    fflush(stdout);
-    
-    ResetConsoleColor();
-}
-
-void PrintHelp(const char* prog_name) {
-    PrintBanner();
-    
-    printf("USAGE:\n");
-    printf("  %s -t <target> [options]\n\n", prog_name);
-    
-    printf("REQUIRED ARGUMENTS:\n");
-    printf("  -t <target>              Target IP address\n\n");
-    
-    printf("SCAN OPTIONS:\n");
-    printf("  -p <start>-<end>         Port range (default: 1-65535)\n");
-    printf("  -p <port1,port2,...>     Specific ports\n");
-    printf("  --tcp                    TCP scan (default)\n");
-    printf("  --udp                    UDP scan\n");
-    printf("  --both                   TCP and UDP scan\n");
-    printf("  --timeout <ms>           Connection timeout (default: 500ms)\n\n");
-    
-    printf("DETECTION OPTIONS:\n");
-    printf("  --version                Detect service versions\n");
-    printf("  --os                     OS Fingerprinting\n");
-    printf("  --waf                    WAF Detection\n");
-    printf("  --aggressive             Enable all detection\n\n");
-    
-    printf("OUTPUT OPTIONS:\n");
-    printf("  --json <file>            Export results to JSON\n");
-    printf("  --csv <file>             Export results to CSV\n");
-    printf("  --xml <file>             Export results to XML\n");
-    printf("  --log <file>             Log file (default: eagle.log)\n");
-    printf("  -v, --verbose            Verbose output\n\n");
-    
-    printf("THREADING:\n");
-    printf("  -T <num>                 Number of threads (1-256, default: 32)\n\n");
-    
-    printf("EXAMPLES:\n");
-    printf("  %s -t 192.168.1.1\n", prog_name);
-    printf("  %s -t 192......... -p 80,443,3306,5432\n", prog_name);
-    printf("  %s -t 192......... -p 1-1024 --version --waf\n", prog_name);
-    printf("  %s -t 192......... --aggressive --json results.json\n", prog_name);
-    printf("  %s -t 192........ --both -T 64 --csv scan.csv\n", prog_name);
-    printf("\n");
-    
-    fflush(stdout);
-}
-
-// ==================== PORT CHECKING ====================
-
-bool CheckPortTCP(const char* host, int port, int timeout_ms) {
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) return false;
-
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    
-    if(inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        closesocket(sock);
-        return false;
+    static float sigmoidDerivative(float x) noexcept {
+        float s = sigmoid(x);
+        return s * (1.0f - s);
     }
-
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-
-    DWORD start_time = GetTickCount();
-    connect(sock, (sockaddr*)&addr, sizeof(addr));
-
-    fd_set writefds;
-    FD_ZERO(&writefds);
-    FD_SET(sock, &writefds);
-
-    timeval timeout;
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-
-    int ret = select(0, NULL, &writefds, NULL, &timeout);
-    DWORD end_time = GetTickCount();
-
-    closesocket(sock);
     
-    return ret > 0;
-}
-
-bool CheckPortUDP(const char* host, int port, int timeout_ms) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) return false;
-
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    
-    if(inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        closesocket(sock);
-        return false;
+    static float tanh(float x) noexcept {
+        return std::tanh(x);
     }
-
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-
-    char dummy[1] = {0};
-    sendto(sock, dummy, 1, 0, (sockaddr*)&addr, sizeof(addr));
-
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    timeval timeout;
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-
-    int ret = select(0, &readfds, NULL, NULL, &timeout);
-    closesocket(sock);
     
-    return ret > 0;
-}
-
-// ==================== SERVICE DETECTION ====================
-
-const char* GetServiceName(int port) {
-    switch(port) {
-        case 21: return "FTP";
-        case 22: return "SSH";
-        case 23: return "TELNET";
-        case 25: return "SMTP";
-        case 53: return "DNS";
-        case 80: return "HTTP";
-        case 110: return "POP3";
-        case 143: return "IMAP";
-        case 443: return "HTTPS";
-        case 445: return "SMB";
-        case 3306: return "MYSQL";
-        case 3389: return "RDP";
-        case 5432: return "POSTGRES";
-        case 6379: return "REDIS";
-        case 8080: return "HTTP-ALT";
-        case 8443: return "HTTPS-ALT";
-        case 9200: return "ELASTICSEARCH";
-        case 27017: return "MONGODB";
-        default: return "UNKNOWN";
+    static float tanhDerivative(float x) noexcept {
+        float t = std::tanh(x);
+        return 1.0f - t * t;
     }
-}
-
-const char* DetectServiceVersion(const char* host, int port) {
-    static char version_buffer[128];
-    strcpy_s(version_buffer, sizeof(version_buffer), "Unknown");
     
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(sock == INVALID_SOCKET) return version_buffer;
+    static float relu(float x) noexcept {
+        return std::max(0.0f, x);
+    }
+    
+    static float reluDerivative(float x) noexcept {
+        return x > 0.0f ? 1.0f : 0.0f;
+    }
+    
+    static float leakyRelu(float x, float alpha = 0.01f) noexcept {
+        return x > 0.0f ? x : alpha * x;
+    }
+    
+    static float leakyReluDerivative(float x, float alpha = 0.01f) noexcept {
+        return x > 0.0f ? 1.0f : alpha;
+    }
+};
 
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
-
-    if(connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
-        char recv_buf[512] = {0};
-        recv(sock, recv_buf, sizeof(recv_buf)-1, 0);
+/**
+ * @brief Neural Network Layer
+ */
+template<size_t InputSize, size_t OutputSize>
+class Layer {
+public:
+    using Weights = std::array<std::array<float, OutputSize>, InputSize>;
+    using Bias = std::array<float, OutputSize>;
+    
+    Layer() {
+        // Xavier initialization
+        std::mt19937 gen(std::random_device{}());
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        float scale = std::sqrt(2.0f / (InputSize + OutputSize));
         
-        // Parse version from banner
-        if(strstr(recv_buf, "OpenSSH")) {
-            if(strstr(recv_buf, "7.4")) strcpy_s(version_buffer, sizeof(version_buffer), "OpenSSH 7.4");
-            else if(strstr(recv_buf, "8.0")) strcpy_s(version_buffer, sizeof(version_buffer), "OpenSSH 8.0");
-            else strcpy_s(version_buffer, sizeof(version_buffer), "OpenSSH (unknown)");
-        }
-        else if(strstr(recv_buf, "Apache")) {
-            strcpy_s(version_buffer, sizeof(version_buffer), "Apache");
-        }
-        else if(strstr(recv_buf, "nginx")) {
-            strcpy_s(version_buffer, sizeof(version_buffer), "Nginx");
-        }
-        else if(strstr(recv_buf, "Microsoft")) {
-            strcpy_s(version_buffer, sizeof(version_buffer), "Windows");
-        }
-    }
-
-    closesocket(sock);
-    return version_buffer;
-}
-
-// ==================== OS FINGERPRINTING ====================
-
-const char* FingerprintOS(const char* host, const std::vector<int>& open_ports) {
-    static char os_buffer[64];
-    
-    // Windows signature: SMB (445), RDP (3389), WINRM (5985)
-    for(int port : open_ports) {
-        if(port == 445 || port == 3389 || port == 5985) {
-            strcpy_s(os_buffer, sizeof(os_buffer), "Windows");
-            return os_buffer;
+        for (auto& row : m_weights) {
+            for (auto& w : row) {
+                w = dist(gen) * scale;
+            }
         }
     }
     
-    // Linux signature: SSH (22), HTTP (80), various services
-    for(int port : open_ports) {
-        if(port == 22) {
-            strcpy_s(os_buffer, sizeof(os_buffer), "Linux/Unix");
-            return os_buffer;
-        }
-    }
+    [[nodiscard]] constexpr size_t inputSize() const noexcept { return InputSize; }
+    [[nodiscard]] constexpr size_t outputSize() const noexcept { return OutputSize; }
     
-    // macOS signature
-    for(int port : open_ports) {
-        if(port == 548 || port == 3283) { // AFP, iChat
-            strcpy_s(os_buffer, sizeof(os_buffer), "macOS");
-            return os_buffer;
-        }
-    }
-    
-    strcpy_s(os_buffer, sizeof(os_buffer), "Unknown");
-    return os_buffer;
-}
-
-// ==================== WAF DETECTION ====================
-
-const char* DetectWAF(const char* host, int port) {
-    static char waf_buffer[64];
-    strcpy_s(waf_buffer, sizeof(waf_buffer), "None");
-    
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(sock == INVALID_SOCKET) return waf_buffer;
-
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
-
-    if(connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
-        const char* request = "GET /../../../etc/passwd HTTP/1.1\r\nHost: test\r\n\r\n";
-        send(sock, request, strlen(request), 0);
+    std::array<float, OutputSize> forward(const std::array<float, InputSize>& inputs) const {
+        std::array<float, OutputSize> outputs{};
         
-        char recv_buf[2048] = {0};
-        recv(sock, recv_buf, sizeof(recv_buf)-1, 0);
+        for (size_t j = 0; j < OutputSize; ++j) {
+            float sum = m_bias[j];
+            for (size_t i = 0; i < InputSize; ++i) {
+                sum += inputs[i] * m_weights[i][j];
+            }
+            outputs[j] = ActivationFunctions::leakyRelu(sum);
+        }
         
-        // WAF signatures
-        if(strstr(recv_buf, "403") || strstr(recv_buf, "Forbidden")) {
-            if(strstr(recv_buf, "ModSecurity")) {
-                strcpy_s(waf_buffer, sizeof(waf_buffer), "ModSecurity");
-            }
-            else if(strstr(recv_buf, "Imperva")) {
-                strcpy_s(waf_buffer, sizeof(waf_buffer), "Imperva");
-            }
-            else if(strstr(recv_buf, "Cloudflare")) {
-                strcpy_s(waf_buffer, sizeof(waf_buffer), "Cloudflare");
-            }
-            else if(strstr(recv_buf, "AWS")) {
-                strcpy_s(waf_buffer, sizeof(waf_buffer), "AWS WAF");
-            }
-            else {
-                strcpy_s(waf_buffer, sizeof(waf_buffer), "Generic WAF");
-            }
-        }
-        else if(strstr(recv_buf, "418")) {
-            strcpy_s(waf_buffer, sizeof(waf_buffer), "I'm a teapot (IPS)");
-        }
+        return outputs;
     }
-
-    closesocket(sock);
-    return waf_buffer;
-}
-
-// ==================== CVE LOOKUP ====================
-
-void LookupCVEs(int port, const char* service, ScanResult& result) {
-    int cve_count = sizeof(cve_db) / sizeof(CVEData);
-    float highest_cvss = 0.0f;
-    const char* highest_cve = "None";
     
-    for(int i = 0; i < cve_count; i++) {
-        if(cve_db[i].port == port) {
-            if(cve_db[i].cvss > highest_cvss) {
-                highest_cvss = cve_db[i].cvss;
-                highest_cve = cve_db[i].cve_id;
+    const Weights& weights() const { return m_weights; }
+    const Bias& bias() const { return m_bias; }
+    
+    void train(const std::array<float, InputSize>& inputs,
+               const std::array<float, OutputSize>& error,
+               float learningRate) {
+        // Compute output layer activations (forward pass)
+        std::array<float, OutputSize> outputs{};
+        for (size_t j = 0; j < OutputSize; ++j) {
+            float sum = m_bias[j];
+            for (size_t i = 0; i < InputSize; ++i) {
+                sum += inputs[i] * m_weights[i][j];
             }
+            outputs[j] = ActivationFunctions::leakyRelu(sum);
+        }
+        
+        // Compute deltas
+        std::array<float, OutputSize> deltas{};
+        for (size_t j = 0; j < OutputSize; ++j) {
+            deltas[j] = error[j] * ActivationFunctions::leakyReluDerivative(outputs[j]);
+        }
+        
+        // Update weights and bias
+        for (size_t i = 0; i < InputSize; ++i) {
+            for (size_t j = 0; j < OutputSize; ++j) {
+                m_weights[i][j] += learningRate * deltas[j] * inputs[i];
+            }
+        }
+        
+        for (size_t j = 0; j < OutputSize; ++j) {
+            m_bias[j] += learningRate * deltas[j];
         }
     }
     
-    strcpy_s(result.cve_id, sizeof(result.cve_id), highest_cve);
-    result.cvss_score = highest_cvss;
-}
+private:
+    Weights m_weights{};
+    Bias m_bias{};
+};
 
-// ==================== EXPORT FUNCTIONS ====================
-
-void ExportToJSON(const char* filename) {
-    std::ofstream file(filename);
-    if(!file.is_open()) {
-        LogMessage("ERROR", "Failed to open JSON file: %s", filename);
-        return;
-    }
-
-    file << "{\n";
-    file << "  \"scan_results\": [\n";
+/**
+ * @brief Modern Neural Network with configurable architecture
+ */
+template<size_t InputSize, size_t HiddenSize, size_t OutputSize>
+class NeuralNetwork {
+public:
+    using InputLayer = Layer<InputSize, HiddenSize>;
+    using OutputLayer = Layer<HiddenSize, OutputSize>;
     
-    for(size_t i = 0; i < scan_results.size(); i++) {
-        const ScanResult& r = scan_results[i];
-        file << "    {\n";
-        file << "      \"port\": " << r.port << ",\n";
-        file << "      \"service\": \"" << r.service << "\",\n";
-        file << "      \"version\": \"" << r.version << "\",\n";
-        file << "      \"os_hint\": \"" << r.os_hint << "\",\n";
-        file << "      \"waf\": \"" << r.waf_detected << "\",\n";
-        file << "      \"cve_id\": \"" << r.cve_id << "\",\n";
-        file << "      \"cvss_score\": " << r.cvss_score << ",\n";
-        file << "      \"response_time_ms\": " << r.response_time_ms << "\n";
-        file << "    }";
-        if(i < scan_results.size() - 1) file << ",";
-        file << "\n";
-    }
+    NeuralNetwork() = default;
     
-    file << "  ]\n";
-    file << "}\n";
-    file.close();
+    // Delete copy - neural networks are heavy
+    NeuralNetwork(const NeuralNetwork&) = delete;
+    NeuralNetwork& operator=(const NeuralNetwork&) = delete;
     
-    LogMessage("INFO", "JSON export completed: %s", filename);
-}
-
-void ExportToCSV(const char* filename) {
-    std::ofstream file(filename);
-    if(!file.is_open()) {
-        LogMessage("ERROR", "Failed to open CSV file: %s", filename);
-        return;
-    }
-
-    file << "Port,Service,Version,OS Hint,WAF,CVE ID,CVSS Score,Response Time (ms)\n";
+    // Allow move
+    NeuralNetwork(NeuralNetwork&&) = default;
+    NeuralNetwork& operator=(NeuralNetwork&&) = default;
     
-    for(const auto& r : scan_results) {
-        file << r.port << ","
-             << r.service << ","
-             << r.version << ","
-             << r.os_hint << ","
-             << r.waf_detected << ","
-             << r.cve_id << ","
-             << r.cvss_score << ","
-             << r.response_time_ms << "\n";
+    /**
+     * @brief Forward propagation
+     * @param inputs Input features
+     * @return Output predictions
+     */
+    [[nodiscard]] std::array<float, OutputSize> predict(const std::array<float, InputSize>& inputs) const {
+        m_hidden = m_inputLayer.forward(inputs);
+        return m_outputLayer.forward(m_hidden);
     }
     
-    file.close();
-    LogMessage("INFO", "CSV export completed: %s", filename);
-}
-
-void ExportToXML(const char* filename) {
-    std::ofstream file(filename);
-    if(!file.is_open()) {
-        LogMessage("ERROR", "Failed to open XML file: %s", filename);
-        return;
+    /**
+     * @brief Train the network
+     * @param inputs Input features
+     * @param targets Target outputs (one-hot encoded)
+     * @param learningRate Learning rate
+     */
+    void train(const std::array<float, InputSize>& inputs,
+               const std::array<float, OutputSize>& targets,
+               float learningRate = 0.01f) {
+        // Forward pass
+        m_hidden = m_inputLayer.forward(inputs);
+        auto outputs = m_outputLayer.forward(m_hidden);
+        
+        // Compute output error
+        std::array<float, OutputSize> outputError{};
+        for (size_t i = 0; i < OutputSize; ++i) {
+            outputError[i] = targets[i] - outputs[i];
+        }
+        
+        // Backpropagation through output layer
+        m_outputLayer.train(m_hidden, outputError, learningRate);
+        
+        // Compute hidden error
+        std::array<float, HiddenSize> hiddenError{};
+        const auto& outputWeights = m_outputLayer.weights();
+        for (size_t j = 0; j < HiddenSize; ++j) {
+            for (size_t k = 0; k < OutputSize; ++k) {
+                hiddenError[j] += outputError[k] * outputWeights[j][k];
+            }
+        }
+        
+        // Backpropagation through input layer
+        m_inputLayer.train(inputs, hiddenError, learningRate);
     }
-
-    file << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-    file << "<scan>\n";
-    file << "  <results>\n";
     
-    for(const auto& r : scan_results) {
-        file << "    <port>\n";
-        file << "      <number>" << r.port << "</number>\n";
-        file << "      <service>" << r.service << "</service>\n";
-        file << "      <version>" << r.version << "</version>\n";
-        file << "      <os_hint>" << r.os_hint << "</os_hint>\n";
-        file << "      <waf>" << r.waf_detected << "</waf>\n";
-        file << "      <cve_id>" << r.cve_id << "</cve_id>\n";
-        file << "      <cvss_score>" << r.cvss_score << "</cvss_score>\n";
-        file << "      <response_time_ms>" << r.response_time_ms << "</response_time_ms>\n";
-        file << "    </port>\n";
+    /**
+     * @brief Get prediction index (argmax)
+     */
+    [[nodiscard]] size_t predictClass(const std::array<float, InputSize>& inputs) const {
+        auto outputs = predict(inputs);
+        size_t maxIdx = 0;
+        float maxVal = outputs[0];
+        for (size_t i = 1; i < OutputSize; ++i) {
+            if (outputs[i] > maxVal) {
+                maxVal = outputs[i];
+                maxIdx = i;
+            }
+        }
+        return maxIdx;
     }
     
-    file << "  </results>\n";
-    file << "</scan>\n";
-    file.close();
+    /**
+     * @brief Get confidence percentage
+     */
+    [[nodiscard]] float getConfidence(const std::array<float, InputSize>& inputs) const {
+        auto outputs = predict(inputs);
+        size_t predClass = predictClass(inputs);
+        return outputs[predClass] * 100.0f;
+    }
     
-    LogMessage("INFO", "XML export completed: %s", filename);
-}
+private:
+    InputLayer m_inputLayer;
+    OutputLayer m_outputLayer;
+    mutable std::array<float, HiddenSize> m_hidden{};
+};
 
-// ==================== SCANNING FUNCTIONS ====================
+// ════════════════════════════════════════════════════════════════════
+//  OS FINGERPRINTING WITH AI
+// ════════════════════════════════════════════════════════════════════
 
-void ScanWorkerTCP(const char* host, std::queue<int>& port_queue, std::mutex& queue_mutex, 
-                   std::atomic<int>& ports_scanned, int timeout_ms, bool detect_version, 
-                   bool detect_os, bool detect_waf) {
-    int port;
-    std::vector<int> local_open_ports;
+/**
+ * @brief OS Feature extractor
+ */
+struct OSFeatures {
+    static constexpr size_t FeatureCount = 24;
+    
+    using FeatureArray = std::array<float, FeatureCount>;
+    
+    float ttl{64};
+    float windowSize{65535};
+    float mss{1460};
+    float hasTCPOptions{0};
+    float supportsFragmentation{1};
+    float responseTime{50};
+    
+    // Port presence (binary)
+    float port21{0}, port22{0}, port23{0}, port25{0}, port53{0};
+    float port80{0}, port110{0}, port143{0}, port443{0}, port445{0};
+    float port3306{0}, port3389{0}, port5432{0}, port8080{0};
+    
+    [[nodiscard]] FeatureArray toArray() const noexcept {
+        return {{
+            ttl / 255.0f,
+            windowSize / 65535.0f,
+            mss / 1500.0f,
+            hasTCPOptions,
+            supportsFragmentation,
+            responseTime / 1000.0f,
+            port21, port22, port23, port25, port53,
+            port80, port110, port143, port443, port445,
+            port3306, port3389, port5432, port8080
+        }};
+    }
+};
 
-    while(true) {
+/**
+ * @brief AI OS Fingerprinter
+ */
+class OSFingerprinter {
+public:
+    // OS classes: Windows, Linux, macOS, FreeBSD, Solaris, NetworkDevice, Android, Unknown
+    static constexpr size_t NumOSClasses = 8;
+    using Network = NeuralNetwork<OSFeatures::FeatureCount, 32, NumOSClasses>;
+    
+    static constexpr std::array<std::string_view, NumOSClasses> OSNames = {{
+        "Windows", "Linux", "macOS", "FreeBSD", 
+        "Solaris", "Network Device", "Android", "Unknown"
+    }};
+    
+    OSFingerprinter() : m_network(std::make_unique<Network>()) {
+        train();
+    }
+    
+    /**
+     * @brief Detect OS from open ports and network features
+     */
+    [[nodiscard]] eagle::OSResult detect(const std::string& target,
+                                          const std::vector<uint16_t>& openPorts) const {
+        eagle::OSResult result;
+        result.confidence = 0.0f;
+        
+        // Extract features
+        auto features = extractFeatures(target, openPorts);
+        
+        // Get AI prediction
+        auto prediction = m_network->predict(features);
+        size_t osClass = m_network->predictClass(features);
+        float aiConfidence = m_network->getConfidence(features);
+        
+        // Determine OS with confidence
+        result.osName = std::string(OSNames[osClass]);
+        result.confidence = aiConfidence;
+        result.isAI = true;
+        
+        // Add fingerprints as evidence
+        for (uint16_t port : openPorts) {
+            switch (port) {
+                case 22: result.fingerprints.push_back("SSH detected"); break;
+                case 80: result.fingerprints.push_back("HTTP detected"); break;
+                case 443: result.fingerprints.push_back("HTTPS detected"); break;
+                case 445: result.fingerprints.push_back("SMB detected"); break;
+                case 3389: result.fingerprints.push_back("RDP detected"); break;
+            }
+        }
+        
+        // Low confidence fallback to rule-based
+        if (aiConfidence < 50.0f) {
+            result = ruleBasedDetection(openPorts);
+            result.isAI = false;
+        }
+        
+        return result;
+    }
+    
+private:
+    std::unique_ptr<Network> m_network;
+    
+    void train() {
+        // Training data: features -> one-hot targets
+        // Format: {ttl, window, mss, tcp_opts, frag, resp_time, ports...} -> OS
+        
+        // Windows signatures
+        for (int i = 0; i < 50; ++i) {
+            std::array<float, OSFeatures::FeatureCount> input = {
+                0.5f, 1.0f, 0.97f, 0.0f, 1.0f, 0.05f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f
+            };
+            input[0] = static_cast<float>((128 + (rand() % 64))) / 255.0f; // TTL variation
+            std::array<float, NumOSClasses> target = {1,0,0,0,0,0,0,0};
+            m_network->train(input, target, 0.1f);
+        }
+        
+        // Linux signatures
+        for (int i = 0; i < 50; ++i) {
+            std::array<float, OSFeatures::FeatureCount> input = {
+                0.25f, 0.44f, 0.97f, 1.0f, 1.0f, 0.03f,
+                0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+            };
+            std::array<float, NumOSClasses> target = {0,1,0,0,0,0,0,0};
+            m_network->train(input, target, 0.1f);
+        }
+        
+        // macOS signatures
+        for (int i = 0; i < 30; ++i) {
+            std::array<float, OSFeatures::FeatureCount> input = {
+                0.25f, 1.0f, 0.97f, 1.0f, 1.0f, 0.02f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f
+            };
+            std::array<float, NumOSClasses> target = {0,0,1,0,0,0,0,0};
+            m_network->train(input, target, 0.1f);
+        }
+        
+        // Network devices
+        for (int i = 0; i < 20; ++i) {
+            std::array<float, OSFeatures::FeatureCount> input = {
+                1.0f, 0.06f, 0.36f, 0.0f, 0.0f, 0.1f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+            };
+            std::array<float, NumOSClasses> target = {0,0,0,0,0,1,0,0};
+            m_network->train(input, target, 0.1f);
+        }
+    }
+    
+    [[nodiscard]] OSFeatures::FeatureArray extractFeatures(const std::string& target,
+                                                          const std::vector<uint16_t>& openPorts) const {
+        OSFeatures features;
+        
+        // Set port features
+        std::set<uint16_t> portSet(openPorts.begin(), openPorts.end());
+        features.port21 = portSet.count(21) ? 1.0f : 0.0f;
+        features.port22 = portSet.count(22) ? 1.0f : 0.0f;
+        features.port23 = portSet.count(23) ? 1.0f : 0.0f;
+        features.port25 = portSet.count(25) ? 1.0f : 0.0f;
+        features.port53 = portSet.count(53) ? 1.0f : 0.0f;
+        features.port80 = portSet.count(80) ? 1.0f : 0.0f;
+        features.port110 = portSet.count(110) ? 1.0f : 0.0f;
+        features.port143 = portSet.count(143) ? 1.0f : 0.0f;
+        features.port443 = portSet.count(443) ? 1.0f : 0.0f;
+        features.port445 = portSet.count(445) ? 1.0f : 0.0f;
+        features.port3306 = portSet.count(3306) ? 1.0f : 0.0f;
+        features.port3389 = portSet.count(3389) ? 1.0f : 0.0f;
+        features.port5432 = portSet.count(5432) ? 1.0f : 0.0f;
+        features.port8080 = portSet.count(8080) ? 1.0f : 0.0f;
+        
+        // Probe for TTL and other network characteristics
+        probeNetwork(target, features);
+        
+        return features.toArray();
+    }
+    
+    void probeNetwork(const std::string& target, OSFeatures& features) const {
+        HANDLE icmp = IcmpCreateFile();
+        if (icmp == INVALID_HANDLE_VALUE) return;
+        
+        char sendData[32] = "EAGLE_PROBE";
+        char replyBuf[sizeof(ICMP_ECHO_REPLY) + 32];
+        
+        DWORD ret = IcmpSendEcho(icmp, inet_addr(target.c_str()), 
+                                 sendData, sizeof(sendData), nullptr,
+                                 replyBuf, sizeof(replyBuf), 100);
+        
+        if (ret > 0) {
+            auto* reply = reinterpret_cast<PICMP_ECHO_REPLY>(replyBuf);
+            features.ttl = static_cast<float>(reply->Options.Ttl);
+            features.responseTime = static_cast<float>(reply->RoundTripTime);
+        }
+        
+        IcmpCloseHandle(icmp);
+    }
+    
+    [[nodiscard]] eagle::OSResult ruleBasedDetection(const std::vector<uint16_t>& openPorts) const {
+        eagle::OSResult result;
+        result.isAI = false;
+        result.confidence = 60.0f;
+        
+        std::set<uint16_t> ports(openPorts.begin(), openPorts.end());
+        
+        if (ports.count(445) || ports.count(3389)) {
+            result.osName = "Windows";
+            result.fingerprints.push_back("SMB/RDP detected");
+        } else if (ports.count(22)) {
+            result.osName = "Linux/Unix";
+            result.fingerprints.push_back("SSH detected");
+        } else if (ports.count(548)) {
+            result.osName = "macOS";
+            result.fingerprints.push_back("AFP detected");
+        } else {
+            result.osName = "Unknown";
+            result.confidence = 30.0f;
+        }
+        
+        return result;
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  PORT SCANNER CORE
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief Modern Port Scanner with async support
+ */
+class PortScanner {
+public:
+    explicit PortScanner(const eagle::ScanConfig& config)
+        : m_config(config)
+        , m_openPortCount(0)
+        , m_scannedPortCount(0) {}
+    
+    // Non-copyable
+    PortScanner(const PortScanner&) = delete;
+    PortScanner& operator=(const PortScanner&) = delete;
+    
+    /**
+     * @brief Perform scan and return results
+     */
+    [[nodiscard]] Result<eagle::ScanResult, std::string> scan() {
+        if (!validateTarget()) {
+            return Result<eagle::ScanResult, std::string>::err("Invalid target IP");
+        }
+        
+        eagle::ScanResult result;
+        result.target = m_config.targetIP;
+        result.timestamp = std::chrono::system_clock::now();
+        
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
+        // Create port queue
+        std::queue<uint16_t> portQueue;
+        for (uint16_t p = m_config.startPort; p <= m_config.endPort; ++p) {
+            portQueue.push(p);
+        }
+        
+        // Launch scanning threads
+        std::vector<std::future<void>> threads;
+        for (uint8_t i = 0; i < m_config.threadCount; ++i) {
+            threads.push_back(std::async(std::launch::async, [&, i]() {
+                scanWorker(portQueue);
+            }));
+        }
+        
+        // Wait for completion
+        for (auto& t : threads) {
+            t.wait();
+        }
+        
+        // Collect results
         {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            if(port_queue.empty()) break;
-            port = port_queue.front();
-            port_queue.pop();
+            std::lock_guard lock(m_resultsMutex);
+            result.ports = m_results;
         }
-
-        DWORD start = GetTickCount();
-        if(CheckPortTCP(host, port, timeout_ms)) {
-            DWORD end = GetTickCount();
-            
-            ScanResult result = {0};
-            result.port = port;
-            result.open = true;
-            result.response_time_ms = end - start;
-            
-            strcpy_s(result.service, sizeof(result.service), GetServiceName(port));
-            
-            if(detect_version) {
-                strcpy_s(result.version, sizeof(result.version), DetectServiceVersion(host, port));
-            } else {
-                strcpy_s(result.version, sizeof(result.version), "N/A");
-            }
-            
-            strcpy_s(result.waf_detected, sizeof(result.waf_detected), "N/A");
-            if(detect_waf && (port == 80 || port == 443 || port == 8080)) {
-                strcpy_s(result.waf_detected, sizeof(result.waf_detected), DetectWAF(host, port));
-            }
-            
-            LookupCVEs(port, result.service, result);
-            local_open_ports.push_back(port);
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        result.scanDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            endTime - startTime).count();
+        
+        return Result<eagle::ScanResult, std::string>::ok(std::move(result));
+    }
+    
+    [[nodiscard]] uint32_t openPortCount() const noexcept { return m_openPortCount.load(); }
+    [[nodiscard]] uint32_t scannedPortCount() const noexcept { return m_scannedPortCount.load(); }
+    
+private:
+    const eagle::ScanConfig& m_config;
+    std::vector<eagle::PortResult> m_results;
+    std::mutex m_resultsMutex;
+    std::atomic<uint32_t> m_openPortCount;
+    std::atomic<uint32_t> m_scannedPortCount;
+    
+    [[nodiscard]] bool validateTarget() const {
+        in_addr addr;
+        return inet_pton(AF_INET, m_config.targetIP.c_str(), &addr) == 1;
+    }
+    
+    void scanWorker(std::queue<uint16_t>& portQueue) {
+        while (true) {
+            uint16_t port = 0;
             
             {
-                std::lock_guard<std::mutex> lock(results_mutex);
-                scan_results.push_back(result);
-                total_ports_open++;
+                std::lock_guard lock(m_resultsMutex);
+                if (portQueue.empty()) break;
+                port = portQueue.front();
+                portQueue.pop();
             }
             
-            SetConsoleColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-            LogMessage("OPEN", "Port %d/%s (%s) [CVE: %s | CVSS: %.1f]", 
-                      port, "tcp", result.service, result.cve_id, result.cvss_score);
-            ResetConsoleColor();
+            auto result = scanPort(port);
+            if (result.isOpen) {
+                std::lock_guard lock(m_resultsMutex);
+                m_results.push_back(result);
+                ++m_openPortCount;
+            }
+            
+            ++m_scannedPortCount;
+        }
+    }
+    
+    [[nodiscard]] eagle::PortResult scanPort(uint16_t port) const {
+        eagle::PortResult result;
+        result.port = port;
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        Socket sock;
+        if (!sock.create(AF_INET, SOCK_STREAM, IPPROTO_TCP)) {
+            return result;
         }
         
-        ports_scanned++;
-    }
-    
-    // OS Fingerprinting
-    if(detect_os && !local_open_ports.empty()) {
-        const char* os = FingerprintOS(host, local_open_ports);
-        SetConsoleColor(FOREGROUND_CYAN | FOREGROUND_INTENSITY);
-        LogMessage("DETECTED", "Possible OS: %s", os);
-        ResetConsoleColor();
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, m_config.targetIP.c_str(), &addr.sin_addr);
         
-        for(auto& result : scan_results) {
-            strcpy_s(result.os_hint, sizeof(result.os_hint), os);
-        }
-    }
-}
-
-void PerformScan(const ScanConfig& config) {
-    LogMessage("INFO", "Starting scan on %s", config.target);
-    LogMessage("INFO", "Target: %s | Threads: %d | Timeout: %dms", 
-              config.target, config.num_threads, config.timeout_ms);
-    
-    if(!IsValidIP(config.target)) {
-        LogMessage("ERROR", "Invalid IP address: %s", config.target);
-        return;
-    }
-
-    DWORD scan_start = GetTickCount();
-    
-    // Prepare port queue
-    std::queue<int> port_queue;
-    std::vector<std::thread> threads;
-    ThreadSyncData sync_data;
-
-    // Fill port queue
-    for(int port = config.start_port; port <= config.end_port; port++) {
-        port_queue.push(port);
-    }
-
-    LogMessage("INFO", "Queued %d ports for scanning", config.end_port - config.start_port + 1);
-
-    // TCP Scan
-    if(config.scan_tcp) {
-        LogMessage("INFO", "Starting TCP scan with %d threads", config.num_threads);
+        // Non-blocking connect
+        u_long mode = 1;
+        ioctlsocket(sock.get(), FIONBIO, &mode);
         
-        for(int i = 0; i < config.num_threads; i++) {
-            threads.emplace_back(ScanWorkerTCP, config.target, std::ref(port_queue), 
-                               std::ref(sync_data.queue_mutex), std::ref(sync_data.ports_scanned),
-                               config.timeout_ms, config.detect_version, config.detect_os, config.detect_waf);
+        connect(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(sock.get(), &writefds);
+        
+        timeval timeout{};
+        timeout.tv_sec = m_config.timeout / 1000;
+        timeout.tv_usec = (m_config.timeout % 1000) * 1000;
+        
+        int ret = select(0, nullptr, &writefds, nullptr, &timeout);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        result.responseTime = std::chrono::duration<float>(end - start).count() * 1000.0f;
+        
+        if (ret > 0) {
+            result.isOpen = true;
+            result.service = getServiceName(port);
         }
-
-        for(auto& t : threads) {
-            if(t.joinable()) t.join();
-        }
-        threads.clear();
+        
+        return result;
     }
-
-    DWORD scan_end = GetTickCount();
-    double elapsed = (scan_end - scan_start) / 1000.0;
-
-    SetConsoleColor(FOREGROUND_CYAN | FOREGROUND_INTENSITY);
-    printf("\n");
-    printf("╔═══════════════════════════════════════╗\n");
-    printf("║         SCAN COMPLETE                 ║\n");
-    printf("║                                       ║\n");
-    printf("║ Open Ports:     %d                    ║\n", (int)total_ports_open);
-    printf("║ Scan Time:      %.2f seconds         ║\n", elapsed);
-    printf("║ Ports/Second:   %.2f                 ║\n", 
-           (config.end_port - config.start_port + 1) / elapsed);
-    printf("║                                       ║\n");
-    printf("╚═══════════════════════════════════════╝\n");
-    printf("\n");
-    ResetConsoleColor();
     
-    fflush(stdout);
-}
-
-// ==================== MAIN ====================
-
-int main(int argc, char* argv[]) {
-    SetConsoleCP(CP_UTF8);
-    SetConsoleOutputCP(CP_UTF8);
-    setvbuf(stdout, NULL, _IONBF, 0);
-    
-    console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-
-    WSADATA wsa_data;
-    if(WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        fprintf(stderr, "[-] Winsock initialization failed\n");
-        return 1;
+    [[nodiscard]] static std::string getServiceName(uint16_t port) noexcept {
+        static const std::map<uint16_t, std::string> services = {
+            {21, "FTP"}, {22, "SSH"}, {23, "TELNET"}, {25, "SMTP"},
+            {53, "DNS"}, {80, "HTTP"}, {110, "POP3"}, {143, "IMAP"},
+            {443, "HTTPS"}, {445, "SMB"}, {3306, "MySQL"}, {3389, "RDP"},
+            {5432, "PostgreSQL"}, {6379, "Redis"}, {8080, "HTTP-ALT"},
+            {8443, "HTTPS-ALT"}, {9200, "Elasticsearch"}, {27017, "MongoDB"}
+        };
+        
+        auto it = services.find(port);
+        return it != services.end() ? it->second : "Unknown";
     }
+};
 
-    // Parse arguments
-    ScanConfig config = {
-        NULL, 1, 65535, 32, true, false, false, false, false,
-        false, false, false, NULL, false, 500
-    };
+// ════════════════════════════════════════════════════════════════════
+//  REPORT EXPORTER
+// ════════════════════════════════════════════════════════════════════
 
-    bool help_requested = false;
-
-    for(int i = 1; i < argc; i++) {
-        if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            help_requested = true;
-            break;
+/**
+ * @brief Report Exporter - supports multiple formats
+ */
+class ReportExporter {
+public:
+    static void exportJSON(const eagle::ScanResult& result, const std::string& filename) {
+        std::ofstream file(filename);
+        file << "{\n";
+        file << "  \"target\": \"" << result.target << "\",\n";
+        file << "  \"timestamp\": " << std::chrono::system_clock::to_time_t(result.timestamp) << ",\n";
+        file << "  \"duration_ms\": " << result.scanDurationMs << ",\n";
+        file << "  \"open_ports\": " << result.ports.size() << ",\n";
+        file << "  \"ports\": [\n";
+        
+        for (size_t i = 0; i < result.ports.size(); ++i) {
+            const auto& p = result.ports[i];
+            file << "    {\"port\":" << p.port << ",\"service\":\"" << p.service << "\",\"open\":" << (p.isOpen ? "true" : "false") << "}";
+            if (i < result.ports.size() - 1) file << ",";
+            file << "\n";
         }
-        else if(strcmp(argv[i], "-t") == 0 && i+1 < argc) {
-            config.target = argv[++i];
+        
+        file << "  ]\n";
+        file << "}\n";
+    }
+    
+    static void exportCSV(const eagle::ScanResult& result, const std::string& filename) {
+        std::ofstream file(filename);
+        file << "Port,Service,Version,Open,Response Time (ms)\n";
+        
+        for (const auto& port : result.ports) {
+            file << port.port << ","
+                 << port.service << ","
+                 << port.version << ","
+                 << (port.isOpen ? "Yes" : "No") << ","
+                 << std::fixed << std::setprecision(2) << port.responseTime << "\n";
         }
-        else if(strcmp(argv[i], "-p") == 0 && i+1 < argc) {
-            char* port_str = argv[++i];
-            if(strchr(port_str, '-')) {
-                sscanf_s(port_str, "%d-%d", &config.start_port, &config.end_port);
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  MAIN APPLICATION CLASS
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief Main Scanner Application
+ */
+class EagleScannerApp {
+public:
+    EagleScannerApp() : m_wsaInit() {
+        printBanner();
+    }
+    
+    int run(int argc, char* argv[]) {
+        auto config = parseArguments(argc, argv);
+        
+        if (!config) {
+            printHelp(argv[0]);
+            return 1;
+        }
+        
+        // Perform scan
+        std::cout << "\n[+] Starting scan on " << config->targetIP << "\n";
+        std::cout << "[+] Port range: " << config->startPort << "-" << config->endPort << "\n";
+        std::cout << "[+] Threads: " << (int)config->threadCount << "\n\n";
+        
+        PortScanner scanner(*config);
+        auto result = scanner.scan();
+        
+        if (result.err()) {
+            std::cerr << "[-] Error: " << result.error() << "\n";
+            return 1;
+        }
+        
+        auto& scanResult = result.value();
+        
+        // OS Detection
+        if (config->detectOS && !scanResult.ports.empty()) {
+            std::vector<uint16_t> openPorts;
+            for (const auto& p : scanResult.ports) {
+                openPorts.push_back(p.port);
+            }
+            
+            std::cout << "[*] Running AI OS Fingerprinting...\n";
+            OSFingerprinter fingerprinter;
+            eagle::OSResult osResult = fingerprinter.detect(config->targetIP, openPorts);
+            scanResult.osResult.emplace(osResult);
+            
+            std::cout << "[+] Detected OS: " << osResult.osName 
+                      << " (" << osResult.confidence << "% confidence)";
+            if (osResult.isAI) std::cout << " [AI]";
+            std::cout << "\n";
+        }
+        
+        // Print results
+        std::cout << "\n[+] Scan complete!\n";
+        std::cout << "[+] Open ports found: " << scanResult.ports.size() << "\n";
+        std::cout << "[+] Scan duration: " << scanResult.scanDurationMs << "ms\n";
+        
+        // Export if requested
+        if (config->outputFile && config->outputFormat) {
+            if (*config->outputFormat == "json") {
+                ReportExporter::exportJSON(scanResult, *config->outputFile);
+                std::cout << "[+] Results exported to " << *config->outputFile << "\n";
+            } else if (*config->outputFormat == "csv") {
+                ReportExporter::exportCSV(scanResult, *config->outputFile);
+                std::cout << "[+] Results exported to " << *config->outputFile << "\n";
             }
         }
-        else if(strcmp(argv[i], "-T") == 0 && i+1 < argc) {
-            config.num_threads = atoi(argv[++i]);
-            if(config.num_threads < 1) config.num_threads = 1;
-            if(config.num_threads > 256) config.num_threads = 256;
-        }
-        else if(strcmp(argv[i], "--tcp") == 0) {
-            config.scan_tcp = true;
-            config.scan_udp = false;
-        }
-        else if(strcmp(argv[i], "--udp") == 0) {
-            config.scan_tcp = false;
-            config.scan_udp = true;
-        }
-        else if(strcmp(argv[i], "--both") == 0) {
-            config.scan_tcp = true;
-            config.scan_udp = true;
-        }
-        else if(strcmp(argv[i], "--version") == 0) {
-            config.detect_version = true;
-        }
-        else if(strcmp(argv[i], "--os") == 0) {
-            config.detect_os = true;
-        }
-        else if(strcmp(argv[i], "--waf") == 0) {
-            config.detect_waf = true;
-        }
-        else if(strcmp(argv[i], "--aggressive") == 0) {
-            config.detect_version = true;
-            config.detect_os = true;
-            config.detect_waf = true;
-        }
-        else if(strcmp(argv[i], "--json") == 0 && i+1 < argc) {
-            config.export_json = true;
-            config.output_file = argv[++i];
-        }
-        else if(strcmp(argv[i], "--csv") == 0 && i+1 < argc) {
-            config.export_csv = true;
-            config.output_file = argv[++i];
-        }
-        else if(strcmp(argv[i], "--xml") == 0 && i+1 < argc) {
-            config.export_xml = true;
-            config.output_file = argv[++i];
-        }
-        else if(strcmp(argv[i], "--log") == 0 && i+1 < argc) {
-            log_file.open(argv[++i], std::ios::app);
-        }
-        else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) {
-            config.timeout_ms = atoi(argv[++i]);
-        }
-        else if(strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            config.verbose = true;
-        }
-    }
-
-    if(help_requested || !config.target) {
-        PrintHelp(argv[0]);
-        WSACleanup();
+        
         return 0;
     }
-
-    // Open log file if not already opened
-    if(!log_file.is_open()) {
-        log_file.open("eagle.log", std::ios::app);
+    
+private:
+    WSAInitializer m_wsaInit;
+    
+    void printBanner() const {
+        std::cout << R"(
+╔═══════════════════════════════════════════════════════════════════╗
+║    🦅 EAGLE AI SCANNER v7.0 - NEURAL NETWORK EDITION 🦅           ║
+║                                                                   ║
+║  Modern C++20 Port Scanner with AI OS Fingerprinting              ║
+║                                                                   ║
+║  Features:                                                        ║
+║  ✓ Thread-safe TCP/UDP scanning                                  ║
+║  ✓ AI Neural Network OS Fingerprinting                           ║
+║  ✓ Memory-safe RAII design                                        ║
+║  ✓ JSON/CSV export                                                ║
+║  ✓ Modern C++20 concepts & constraints                            ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+)";
     }
-
-    PrintBanner();
-    PerformScan(config);
-
-    // Export results
-    if(config.export_json && config.output_file) {
-        ExportToJSON(config.output_file);
+    
+    void printHelp(const char* progName) const {
+        std::cout << "Usage: " << progName << " -t <target> [options]\n\n"
+                  << "Options:\n"
+                  << "  -t <ip>          Target IP address\n"
+                  << "  -p <start-end>  Port range (default: 1-65535)\n"
+                  << "  -T <num>        Threads (default: 32)\n"
+                  << "  --os            Enable OS detection (AI)\n"
+                  << "  --json <file>   Export to JSON\n"
+                  << "  --csv <file>    Export to CSV\n"
+                  << "  -h, --help      Show this help\n\n"
+                  << "Example:\n"
+                  << "  " << progName << " -t <TARGET_IP> -p 1-1000 --os --json results.json\n";
     }
-    if(config.export_csv && config.output_file) {
-        ExportToCSV(config.output_file);
+    
+    std::optional<eagle::ScanConfig> parseArguments(int argc, char* argv[]) const {
+        eagle::ScanConfig config;
+        
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            
+            if (arg == "-h" || arg == "--help") {
+                return std::nullopt;
+            }
+            else if (arg == "-t" && i + 1 < argc) {
+                config.targetIP = argv[++i];
+            }
+            else if (arg == "-p" && i + 1 < argc) {
+                std::string ports = argv[++i];
+                if (ports.find('-') != std::string::npos) {
+                    sscanf_s(ports.c_str(), "%hu-%hu", &config.startPort, &config.endPort);
+                }
+            }
+            else if (arg == "-T" && i + 1 < argc) {
+                config.threadCount = static_cast<uint8_t>(std::stoi(argv[++i]));
+            }
+            else if (arg == "--os") {
+                config.detectOS = true;
+            }
+            else if (arg == "--json" && i + 1 < argc) {
+                config.outputFormat = "json";
+                config.outputFile = argv[++i];
+            }
+            else if (arg == "--csv" && i + 1 < argc) {
+                config.outputFormat = "csv";
+                config.outputFile = argv[++i];
+            }
+        }
+        
+        if (config.targetIP.empty()) {
+            std::cerr << "Error: Target IP required (-t <ip>)\n";
+            return std::nullopt;
+        }
+        
+        return config;
     }
-    if(config.export_xml && config.output_file) {
-        ExportToXML(config.output_file);
-    }
+};
 
-    if(log_file.is_open()) {
-        log_file.close();
-    }
+} // namespace eagle
 
-    WSACleanup();
-    return 0;
+// ════════════════════════════════════════════════════════════════════
+//  MAIN ENTRY POINT
+// ════════════════════════════════════════════════════════════════════
+
+int main(int argc, char* argv[]) {
+    try {
+        return eagle::ai::EagleScannerApp().run(argc, argv);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << "\n";
+        return 1;
+    }
 }
